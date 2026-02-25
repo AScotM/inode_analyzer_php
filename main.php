@@ -3,6 +3,30 @@
 
 define('DS', DIRECTORY_SEPARATOR);
 
+if (!function_exists('fnmatch')) {
+    function fnmatch($pattern, $string) {
+        return preg_match("#^" . strtr(preg_quote($pattern, '#'), ['\*' => '.*', '\?' => '.']) . "$#i", $string);
+    }
+}
+
+class LargestFilesHeap extends SplMaxHeap {
+    public function compare($a, $b) {
+        return $a[0] <=> $b[0];
+    }
+}
+
+class OldestFilesHeap extends SplMinHeap {
+    public function compare($a, $b) {
+        return $a[0] <=> $b[0];
+    }
+}
+
+class NewestFilesHeap extends SplMinHeap {
+    public function compare($a, $b) {
+        return $a[0] <=> $b[0];
+    }
+}
+
 class InodeAnalyzer
 {
     private array $stats = [
@@ -27,7 +51,14 @@ class InodeAnalyzer
         'empty_dirs' => 0,
         'broken_symlinks' => 0,
         'permission_denied' => 0,
-        'file_types' => []
+        'file_types' => [
+            'directory' => 0,
+            'symlink' => 0,
+            'socket' => 0,
+            'fifo' => 0,
+            'device' => 0,
+            'regular' => 0
+        ]
     ];
     
     private int $threads;
@@ -37,10 +68,17 @@ class InodeAnalyzer
     private array $processedPaths = [];
     private array $fileMetadata = [];
     private bool $interrupted = false;
-    private array $largestFilesHeap = [];
-    private array $oldestFilesHeap = [];
-    private array $newestFilesHeap = [];
-    private array $lock = [];
+    private LargestFilesHeap $largestFilesHeap;
+    private OldestFilesHeap $oldestFilesHeap;
+    private NewestFilesHeap $newestFilesHeap;
+    private array $lock = [
+        'stats' => false,
+        'size' => false,
+        'heaps' => false
+    ];
+    private int $processedCount = 0;
+    private int $totalItems = 0;
+    private string $currentPath = '';
     
     private const SIZE_CATEGORIES = [
         '< 1 KB' => 1,
@@ -73,6 +111,9 @@ class InodeAnalyzer
         $this->threads = $threads;
         $this->followSymlinks = $followSymlinks;
         $this->excludePatterns = $excludePatterns;
+        $this->largestFilesHeap = new LargestFilesHeap();
+        $this->oldestFilesHeap = new OldestFilesHeap();
+        $this->newestFilesHeap = new NewestFilesHeap();
         
         if (function_exists('pcntl_signal')) {
             pcntl_signal(SIGINT, [$this, 'handleInterrupt']);
@@ -143,6 +184,17 @@ class InodeAnalyzer
         return ($mode & self::S_IFMT) === self::S_IFCHR;
     }
     
+    private function updateProgress(): void
+    {
+        if ($this->totalItems > 0) {
+            $this->processedCount++;
+            if ($this->processedCount % 1000 == 0) {
+                $progress = round(($this->processedCount / $this->totalItems) * 100, 1);
+                echo "\r  Progress: {$progress}% ({$this->processedCount}/{$this->totalItems})";
+            }
+        }
+    }
+    
     public function analyzeDirectory(
         string $path,
         int $sampleSize = 20,
@@ -191,11 +243,11 @@ class InodeAnalyzer
             $this->quickScanAnalysis($path, $sampleSize, $maxDepth);
         }
         
-        if ($findDuplicates && !$deepScan) {
+        if ($findDuplicates && !$deepScan && !$this->interrupted) {
             $this->findDuplicateFiles($path);
         }
         
-        if ($saveState) {
+        if ($saveState && !$this->interrupted) {
             $this->saveCheckpoint($saveState);
         }
         
@@ -215,13 +267,31 @@ class InodeAnalyzer
     {
         echo "Scanning filesystem...\n";
         
-        $filesCount = 0;
-        $dirsCount = 0;
-        $symlinksCount = 0;
-        $socketsCount = 0;
-        $fifosCount = 0;
-        $devicesCount = 0;
+        $this->processedCount = 0;
+        $this->totalItems = 0;
         
+        try {
+            $directoryIterator = new RecursiveDirectoryIterator(
+                $path, 
+                FilesystemIterator::SKIP_DOTS | FilesystemIterator::UNIX_PATHS | FilesystemIterator::FOLLOW_SYMLINKS
+            );
+            $iterator = new RecursiveIteratorIterator(
+                $directoryIterator, 
+                RecursiveIteratorIterator::SELF_FIRST,
+                RecursiveIteratorIterator::CATCH_GET_CHILD
+            );
+        } catch (Exception $e) {
+            echo "Error opening directory: {$e->getMessage()}\n";
+            return;
+        }
+        
+        $iterator->rewind();
+        while ($iterator->valid()) {
+            $this->totalItems++;
+            $iterator->next();
+        }
+        
+        $this->processedCount = 0;
         $baseDepth = count(explode(DS, $path));
         
         try {
@@ -229,7 +299,11 @@ class InodeAnalyzer
                 $path, 
                 FilesystemIterator::SKIP_DOTS | FilesystemIterator::UNIX_PATHS | FilesystemIterator::FOLLOW_SYMLINKS
             );
-            $iterator = new RecursiveIteratorIterator($directoryIterator, RecursiveIteratorIterator::SELF_FIRST);
+            $iterator = new RecursiveIteratorIterator(
+                $directoryIterator, 
+                RecursiveIteratorIterator::SELF_FIRST,
+                RecursiveIteratorIterator::CATCH_GET_CHILD
+            );
         } catch (Exception $e) {
             echo "Error opening directory: {$e->getMessage()}\n";
             return;
@@ -242,18 +316,20 @@ class InodeAnalyzer
             
             $currentDepth = count(explode(DS, $item->getPathname())) - $baseDepth;
             if ($maxDepth && $currentDepth >= $maxDepth) {
+                $this->updateProgress();
                 continue;
             }
             
             $itemPath = $item->getPathname();
             
             if ($this->shouldExclude($itemPath)) {
+                $this->updateProgress();
                 continue;
             }
             
             if ($item->isDir()) {
-                $dirsCount++;
-                $this->stats['file_types']['directory'] = ($this->stats['file_types']['directory'] ?? 0) + 1;
+                $this->stats['total_dirs']++;
+                $this->stats['file_types']['directory']++;
                 try {
                     if (count(scandir($itemPath)) == 2) {
                         $this->stats['empty_dirs']++;
@@ -261,6 +337,7 @@ class InodeAnalyzer
                 } catch (Exception $e) {
                     $this->stats['permission_denied']++;
                 }
+                $this->updateProgress();
                 continue;
             }
             
@@ -268,27 +345,28 @@ class InodeAnalyzer
                 $statInfo = $this->followSymlinks ? stat($itemPath) : lstat($itemPath);
                 if ($statInfo === false) {
                     $this->stats['permission_denied']++;
+                    $this->updateProgress();
                     continue;
                 }
                 
                 if (is_link($itemPath)) {
-                    $symlinksCount++;
-                    $this->stats['file_types']['symlink'] = ($this->stats['file_types']['symlink'] ?? 0) + 1;
+                    $this->stats['total_symlinks']++;
+                    $this->stats['file_types']['symlink']++;
                     if (!file_exists($itemPath)) {
                         $this->stats['broken_symlinks']++;
                     }
                 } elseif ($this->isSocket($statInfo['mode'])) {
-                    $socketsCount++;
-                    $this->stats['file_types']['socket'] = ($this->stats['file_types']['socket'] ?? 0) + 1;
+                    $this->stats['total_sockets']++;
+                    $this->stats['file_types']['socket']++;
                 } elseif ($this->isFifo($statInfo['mode'])) {
-                    $fifosCount++;
-                    $this->stats['file_types']['fifo'] = ($this->stats['file_types']['fifo'] ?? 0) + 1;
+                    $this->stats['total_fifos']++;
+                    $this->stats['file_types']['fifo']++;
                 } elseif ($this->isBlockDevice($statInfo['mode']) || $this->isCharDevice($statInfo['mode'])) {
-                    $devicesCount++;
-                    $this->stats['file_types']['device'] = ($this->stats['file_types']['device'] ?? 0) + 1;
+                    $this->stats['total_devices']++;
+                    $this->stats['file_types']['device']++;
                 } elseif (is_file($itemPath)) {
-                    $filesCount++;
-                    $this->stats['file_types']['regular'] = ($this->stats['file_types']['regular'] ?? 0) + 1;
+                    $this->stats['total_files']++;
+                    $this->stats['file_types']['regular']++;
                     
                     $size = $statInfo['size'];
                     $this->totalSize += $size;
@@ -301,19 +379,15 @@ class InodeAnalyzer
                     
                     $owner = $statInfo['uid'];
                     if (function_exists('posix_getpwuid')) {
-                        try {
-                            $ownerInfo = posix_getpwuid($statInfo['uid']);
-                            $owner = $ownerInfo['name'] ?? $owner;
-                        } catch (Exception $e) {}
+                        $ownerInfo = @posix_getpwuid($statInfo['uid']);
+                        $owner = $ownerInfo['name'] ?? $owner;
                     }
                     $this->stats['owners'][$owner] = ($this->stats['owners'][$owner] ?? 0) + 1;
                     
                     $group = $statInfo['gid'];
                     if (function_exists('posix_getgrgid')) {
-                        try {
-                            $groupInfo = posix_getgrgid($statInfo['gid']);
-                            $group = $groupInfo['name'] ?? $group;
-                        } catch (Exception $e) {}
+                        $groupInfo = @posix_getgrgid($statInfo['gid']);
+                        $group = $groupInfo['name'] ?? $group;
                     }
                     $this->stats['groups'][$group] = ($this->stats['groups'][$group] ?? 0) + 1;
                     
@@ -327,64 +401,58 @@ class InodeAnalyzer
                         $this->stats['empty_files']++;
                     }
                     
-                    $mtime = date('Y-m-d H:i:s', $statInfo['mtime']);
-                    $ageCategory = $this->categorizeAge($statInfo['mtime']);
+                    $mtime = $statInfo['mtime'];
+                    $ageCategory = $this->categorizeAge($mtime);
                     $this->stats['age_distribution'][$ageCategory] = ($this->stats['age_distribution'][$ageCategory] ?? 0) + 1;
                     
                     $this->fileMetadata[$itemPath] = [
                         'path' => $itemPath,
                         'size' => $size,
-                        'mtime' => $mtime,
+                        'mtime' => date('Y-m-d H:i:s', $mtime),
                         'owner' => $owner,
                         'group' => $group,
                         'permissions' => $perms,
                         'extension' => $ext
                     ];
                     
-                    $this->largestFilesHeap[] = [$size, $itemPath, $mtime, $owner, $group, $perms];
-                    usort($this->largestFilesHeap, fn($a, $b) => $b[0] <=> $a[0]);
-                    if (count($this->largestFilesHeap) > $sampleSize * 2) {
-                        array_pop($this->largestFilesHeap);
-                    }
-                    
-                    $this->oldestFilesHeap[] = [$statInfo['mtime'], $itemPath, $size, $owner, $group, $perms];
-                    usort($this->oldestFilesHeap, fn($a, $b) => $a[0] <=> $b[0]);
-                    if (count($this->oldestFilesHeap) > $sampleSize * 2) {
-                        array_pop($this->oldestFilesHeap);
-                    }
-                    
-                    $this->newestFilesHeap[] = [-$statInfo['mtime'], $itemPath, $size, $owner, $group, $perms];
-                    usort($this->newestFilesHeap, fn($a, $b) => $a[0] <=> $b[0]);
-                    if (count($this->newestFilesHeap) > $sampleSize * 2) {
-                        array_pop($this->newestFilesHeap);
-                    }
+                    $this->largestFilesHeap->insert([$size, $itemPath, date('Y-m-d H:i:s', $mtime), $owner, $group, $perms]);
+                    $this->oldestFilesHeap->insert([$mtime, $itemPath, $size, $owner, $group, $perms]);
+                    $this->newestFilesHeap->insert([-$mtime, $itemPath, $size, $owner, $group, $perms]);
                 }
                 
             } catch (Exception $e) {
                 $this->stats['permission_denied']++;
             }
+            
+            $this->updateProgress();
         }
         
-        $this->stats['total_files'] = $filesCount;
-        $this->stats['total_dirs'] = $dirsCount;
-        $this->stats['total_symlinks'] = $symlinksCount;
-        $this->stats['total_sockets'] = $socketsCount;
-        $this->stats['total_fifos'] = $fifosCount;
-        $this->stats['total_devices'] = $devicesCount;
-        
-        $this->stats['largest_files'] = array_slice($this->largestFilesHeap, 0, $sampleSize);
-        
-        $oldestList = [];
-        foreach (array_slice($this->oldestFilesHeap, 0, $sampleSize) as $item) {
-            $oldestList[] = [$item[2], $item[1], date('Y-m-d H:i:s', $item[0]), $item[3], $item[4], $item[5]];
+        if (!$this->interrupted) {
+            echo "\r  Progress: 100% ({$this->processedCount}/{$this->totalItems})\n";
         }
-        $this->stats['oldest_files'] = $oldestList;
         
-        $newestList = [];
-        foreach (array_slice($this->newestFilesHeap, 0, $sampleSize) as $item) {
-            $newestList[] = [$item[2], $item[1], date('Y-m-d H:i:s', -$item[0]), $item[3], $item[4], $item[5]];
+        $largestFiles = [];
+        $largestHeap = clone $this->largestFilesHeap;
+        for ($i = 0; $i < $sampleSize && !$largestHeap->isEmpty(); $i++) {
+            $largestFiles[] = $largestHeap->extract();
         }
-        $this->stats['newest_files'] = $newestList;
+        $this->stats['largest_files'] = $largestFiles;
+        
+        $oldestFiles = [];
+        $oldestHeap = clone $this->oldestFilesHeap;
+        for ($i = 0; $i < $sampleSize && !$oldestHeap->isEmpty(); $i++) {
+            $item = $oldestHeap->extract();
+            $oldestFiles[] = [$item[2], $item[1], date('Y-m-d H:i:s', $item[0]), $item[3], $item[4], $item[5]];
+        }
+        $this->stats['oldest_files'] = $oldestFiles;
+        
+        $newestFiles = [];
+        $newestHeap = clone $this->newestFilesHeap;
+        for ($i = 0; $i < $sampleSize && !$newestHeap->isEmpty(); $i++) {
+            $item = $newestHeap->extract();
+            $newestFiles[] = [$item[2], $item[1], date('Y-m-d H:i:s', -$item[0]), $item[3], $item[4], $item[5]];
+        }
+        $this->stats['newest_files'] = $newestFiles;
         
         $this->analyzeLargestDirectories($path, $sampleSize);
     }
@@ -393,7 +461,31 @@ class InodeAnalyzer
     {
         echo "Deep Analysis\n\n";
         
-        $items = [];
+        $this->processedCount = 0;
+        $this->totalItems = 0;
+        
+        try {
+            $directoryIterator = new RecursiveDirectoryIterator(
+                $path, 
+                FilesystemIterator::SKIP_DOTS | FilesystemIterator::UNIX_PATHS | FilesystemIterator::FOLLOW_SYMLINKS
+            );
+            $iterator = new RecursiveIteratorIterator(
+                $directoryIterator, 
+                RecursiveIteratorIterator::SELF_FIRST,
+                RecursiveIteratorIterator::CATCH_GET_CHILD
+            );
+        } catch (Exception $e) {
+            echo "Error opening directory: {$e->getMessage()}\n";
+            return;
+        }
+        
+        $iterator->rewind();
+        while ($iterator->valid()) {
+            $this->totalItems++;
+            $iterator->next();
+        }
+        
+        $this->processedCount = 0;
         $baseDepth = count(explode(DS, $path));
         
         try {
@@ -401,7 +493,11 @@ class InodeAnalyzer
                 $path, 
                 FilesystemIterator::SKIP_DOTS | FilesystemIterator::UNIX_PATHS | FilesystemIterator::FOLLOW_SYMLINKS
             );
-            $iterator = new RecursiveIteratorIterator($directoryIterator, RecursiveIteratorIterator::SELF_FIRST);
+            $iterator = new RecursiveIteratorIterator(
+                $directoryIterator, 
+                RecursiveIteratorIterator::SELF_FIRST,
+                RecursiveIteratorIterator::CATCH_GET_CHILD
+            );
         } catch (Exception $e) {
             echo "Error opening directory: {$e->getMessage()}\n";
             return;
@@ -414,60 +510,48 @@ class InodeAnalyzer
             
             $currentDepth = count(explode(DS, $item->getPathname())) - $baseDepth;
             if ($maxDepth && $currentDepth >= $maxDepth) {
+                $this->updateProgress();
                 continue;
             }
             
             $itemPath = $item->getPathname();
             if (!$this->shouldExclude($itemPath)) {
-                $items[] = $itemPath;
-            }
-        }
-        
-        $totalItems = count($items);
-        echo "  Scanning " . $this->getHumanReadable($totalItems, false) . " items...\n";
-        
-        $processed = 0;
-        foreach ($items as $item) {
-            if ($this->interrupted) {
-                break;
+                $this->analyzeItemDeep($itemPath, $ageDays);
             }
             
-            if (!in_array($item, $this->processedPaths)) {
-                $this->processedPaths[] = $item;
-                $this->analyzeItemDeep($item, $ageDays);
-            }
-            
-            $processed++;
-            if ($processed % 1000 == 0 && $totalItems > 0) {
-                $progress = round(($processed / $totalItems) * 100, 1);
-                echo "\r  Progress: {$progress}% ({$processed}/{$totalItems})";
-            }
+            $this->updateProgress();
         }
         
         if (!$this->interrupted) {
-            echo "\r  Progress: 100% ({$totalItems}/{$totalItems})\n";
+            echo "\r  Progress: 100% ({$this->processedCount}/{$this->totalItems})\n";
         }
         
         if ($this->interrupted) {
             echo "\nScan interrupted - partial results\n";
         }
         
-        usort($this->largestFilesHeap, fn($a, $b) => $b[0] <=> $a[0]);
-        $this->stats['largest_files'] = array_slice($this->largestFilesHeap, 0, $sampleSize);
-        
-        usort($this->oldestFilesHeap, fn($a, $b) => $a[0] <=> $b[0]);
-        $oldestList = [];
-        foreach (array_slice($this->oldestFilesHeap, 0, $sampleSize) as $item) {
-            $oldestList[] = [$item[2], $item[1], date('Y-m-d H:i:s', $item[0]), $item[3], $item[4], $item[5]];
+        $largestFiles = [];
+        $largestHeap = clone $this->largestFilesHeap;
+        for ($i = 0; $i < $sampleSize && !$largestHeap->isEmpty(); $i++) {
+            $largestFiles[] = $largestHeap->extract();
         }
-        $this->stats['oldest_files'] = $oldestList;
+        $this->stats['largest_files'] = $largestFiles;
         
-        usort($this->newestFilesHeap, fn($a, $b) => $a[0] <=> $b[0]);
-        $newestList = [];
-        foreach (array_slice($this->newestFilesHeap, 0, $sampleSize) as $item) {
-            $newestList[] = [$item[2], $item[1], date('Y-m-d H:i:s', -$item[0]), $item[3], $item[4], $item[5]];
+        $oldestFiles = [];
+        $oldestHeap = clone $this->oldestFilesHeap;
+        for ($i = 0; $i < $sampleSize && !$oldestHeap->isEmpty(); $i++) {
+            $item = $oldestHeap->extract();
+            $oldestFiles[] = [$item[2], $item[1], date('Y-m-d H:i:s', $item[0]), $item[3], $item[4], $item[5]];
         }
-        $this->stats['newest_files'] = $newestList;
+        $this->stats['oldest_files'] = $oldestFiles;
+        
+        $newestFiles = [];
+        $newestHeap = clone $this->newestFilesHeap;
+        for ($i = 0; $i < $sampleSize && !$newestHeap->isEmpty(); $i++) {
+            $item = $newestHeap->extract();
+            $newestFiles[] = [$item[2], $item[1], date('Y-m-d H:i:s', -$item[0]), $item[3], $item[4], $item[5]];
+        }
+        $this->stats['newest_files'] = $newestFiles;
         
         $this->analyzeLargestDirectories($path, $sampleSize, true);
         
@@ -483,16 +567,18 @@ class InodeAnalyzer
                 return;
             }
             
-            $statInfo = $this->followSymlinks ? stat($item) : lstat($item);
+            $statInfo = $this->followSymlinks ? @stat($item) : @lstat($item);
             if ($statInfo === false) {
+                $this->acquireLock('stats');
                 $this->stats['permission_denied']++;
+                $this->releaseLock('stats');
                 return;
             }
             
             if (is_link($item)) {
                 $this->acquireLock('stats');
                 $this->stats['total_symlinks']++;
-                $this->stats['file_types']['symlink'] = ($this->stats['file_types']['symlink'] ?? 0) + 1;
+                $this->stats['file_types']['symlink']++;
                 if (!file_exists($item)) {
                     $this->stats['broken_symlinks']++;
                 }
@@ -501,29 +587,29 @@ class InodeAnalyzer
             } elseif ($this->isSocket($statInfo['mode'])) {
                 $this->acquireLock('stats');
                 $this->stats['total_sockets']++;
-                $this->stats['file_types']['socket'] = ($this->stats['file_types']['socket'] ?? 0) + 1;
+                $this->stats['file_types']['socket']++;
                 $this->releaseLock('stats');
                 
             } elseif ($this->isFifo($statInfo['mode'])) {
                 $this->acquireLock('stats');
                 $this->stats['total_fifos']++;
-                $this->stats['file_types']['fifo'] = ($this->stats['file_types']['fifo'] ?? 0) + 1;
+                $this->stats['file_types']['fifo']++;
                 $this->releaseLock('stats');
                 
             } elseif ($this->isBlockDevice($statInfo['mode']) || $this->isCharDevice($statInfo['mode'])) {
                 $this->acquireLock('stats');
                 $this->stats['total_devices']++;
-                $this->stats['file_types']['device'] = ($this->stats['file_types']['device'] ?? 0) + 1;
+                $this->stats['file_types']['device']++;
                 $this->releaseLock('stats');
                 
             } elseif (is_dir($item) && !is_link($item)) {
                 $this->acquireLock('stats');
                 $this->stats['total_dirs']++;
-                $this->stats['file_types']['directory'] = ($this->stats['file_types']['directory'] ?? 0) + 1;
+                $this->stats['file_types']['directory']++;
                 $this->releaseLock('stats');
                 
                 try {
-                    if (count(scandir($item)) == 2) {
+                    if (count(@scandir($item)) == 2) {
                         $this->acquireLock('stats');
                         $this->stats['empty_dirs']++;
                         $this->releaseLock('stats');
@@ -533,7 +619,7 @@ class InodeAnalyzer
             } elseif (is_file($item)) {
                 $this->acquireLock('stats');
                 $this->stats['total_files']++;
-                $this->stats['file_types']['regular'] = ($this->stats['file_types']['regular'] ?? 0) + 1;
+                $this->stats['file_types']['regular']++;
                 $this->releaseLock('stats');
                 
                 if ($ageDays) {
@@ -563,19 +649,15 @@ class InodeAnalyzer
                 
                 $owner = $statInfo['uid'];
                 if (function_exists('posix_getpwuid')) {
-                    try {
-                        $ownerInfo = posix_getpwuid($statInfo['uid']);
-                        $owner = $ownerInfo['name'] ?? $owner;
-                    } catch (Exception $e) {}
+                    $ownerInfo = @posix_getpwuid($statInfo['uid']);
+                    $owner = $ownerInfo['name'] ?? $owner;
                 }
                 $this->stats['owners'][$owner] = ($this->stats['owners'][$owner] ?? 0) + 1;
                 
                 $group = $statInfo['gid'];
                 if (function_exists('posix_getgrgid')) {
-                    try {
-                        $groupInfo = posix_getgrgid($statInfo['gid']);
-                        $group = $groupInfo['name'] ?? $group;
-                    } catch (Exception $e) {}
+                    $groupInfo = @posix_getgrgid($statInfo['gid']);
+                    $group = $groupInfo['name'] ?? $group;
                 }
                 $this->stats['groups'][$group] = ($this->stats['groups'][$group] ?? 0) + 1;
                 
@@ -602,22 +684,9 @@ class InodeAnalyzer
                 $this->releaseLock('stats');
                 
                 $this->acquireLock('heaps');
-                $this->largestFilesHeap[] = [$size, $item, date('Y-m-d H:i:s', $mtime), $owner, $group, $perms];
-                $this->oldestFilesHeap[] = [$mtime, $item, $size, $owner, $group, $perms];
-                $this->newestFilesHeap[] = [-$mtime, $item, $size, $owner, $group, $perms];
-                
-                if (count($this->largestFilesHeap) > 1000) {
-                    usort($this->largestFilesHeap, fn($a, $b) => $b[0] <=> $a[0]);
-                    array_pop($this->largestFilesHeap);
-                }
-                if (count($this->oldestFilesHeap) > 1000) {
-                    usort($this->oldestFilesHeap, fn($a, $b) => $a[0] <=> $b[0]);
-                    array_pop($this->oldestFilesHeap);
-                }
-                if (count($this->newestFilesHeap) > 1000) {
-                    usort($this->newestFilesHeap, fn($a, $b) => $a[0] <=> $b[0]);
-                    array_pop($this->newestFilesHeap);
-                }
+                $this->largestFilesHeap->insert([$size, $item, date('Y-m-d H:i:s', $mtime), $owner, $group, $perms]);
+                $this->oldestFilesHeap->insert([$mtime, $item, $size, $owner, $group, $perms]);
+                $this->newestFilesHeap->insert([-$mtime, $item, $size, $owner, $group, $perms]);
                 $this->releaseLock('heaps');
             }
             
@@ -687,7 +756,11 @@ class InodeAnalyzer
                 $path, 
                 FilesystemIterator::SKIP_DOTS | FilesystemIterator::UNIX_PATHS | FilesystemIterator::FOLLOW_SYMLINKS
             );
-            $iterator = new RecursiveIteratorIterator($directoryIterator, RecursiveIteratorIterator::LEAVES_ONLY);
+            $iterator = new RecursiveIteratorIterator(
+                $directoryIterator, 
+                RecursiveIteratorIterator::LEAVES_ONLY,
+                RecursiveIteratorIterator::CATCH_GET_CHILD
+            );
         } catch (Exception $e) {
             echo "Error opening directory: {$e->getMessage()}\n";
             return;
@@ -784,7 +857,7 @@ class InodeAnalyzer
         }
         
         $hash = hash_init('md5');
-        $handle = fopen($filepath, 'rb');
+        $handle = @fopen($filepath, 'rb');
         if ($handle === false) {
             return null;
         }
